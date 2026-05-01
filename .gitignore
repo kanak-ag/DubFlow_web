@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Downloaded files
+downloads/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
