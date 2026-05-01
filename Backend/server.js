@@ -12,6 +12,7 @@ const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const gTTS = require('gtts');
+const { ElevenLabsClient } = require('elevenlabs');
 const { v4: uuidv4 } = require('uuid');
 const { exec } = require('child_process');
 const { promisify } = require('util');
@@ -53,6 +54,37 @@ const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = 'google-translator9.p.rapidapi.com';
 let translatorAvailable = !!RAPIDAPI_KEY;
 
+// Log translator status on startup
+console.log(`🔑 Translator Status: ${translatorAvailable ? 'ENABLED' : 'DISABLED'} (RAPIDAPI_KEY ${RAPIDAPI_KEY ? 'SET' : 'MISSING'})`);
+
+// ElevenLabs TTS Configuration
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+let elevenLabsAvailable = !!ELEVENLABS_API_KEY;
+let elevenLabsClient = null;
+
+if (elevenLabsAvailable) {
+  try {
+    // Try global endpoint first
+    elevenLabsClient = new ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
+    console.log(`🔊 ElevenLabs Status: ENABLED (API Key Set)`);
+  } catch (err) {
+    console.log(`❌ ElevenLabs initialization failed: ${err.message}`);
+    elevenLabsAvailable = false;
+  }
+} else {
+  console.log(`🔊 ElevenLabs Status: DISABLED`);
+}
+
+// Soniox TTS Configuration
+const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
+let sonioxAvailable = !!SONIOX_API_KEY;
+
+if (sonioxAvailable) {
+  console.log(`🔊 Soniox Status: ENABLED (API Key Set)`);
+} else {
+  console.log(`🔊 Soniox Status: DISABLED`);
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -75,7 +107,9 @@ const extractVideoId = (url) => {
 const getRapidApiLanguageCode = (language) => {
   const map = {
     'spanish': 'es','french': 'fr','german': 'de','italian': 'it','portuguese': 'pt',
-    'hindi': 'hi','japanese': 'ja','korean': 'ko','chinese': 'zh-CN','english': 'en'
+    'hindi': 'hi','japanese': 'ja','korean': 'ko','chinese': 'zh-CN','english': 'en',
+    'bengali': 'bn','telugu': 'te','marathi': 'mr','tamil': 'ta','gujarati': 'gu',
+    'kannada': 'kn','malayalam': 'ml','punjabi': 'pa','urdu': 'ur'
   };
   return map[language.toLowerCase()] || language.toLowerCase();
 };
@@ -83,9 +117,14 @@ const getRapidApiLanguageCode = (language) => {
 // Translate text
 const translateText = async (text, targetLanguage) => {
   try {
-    if (!translatorAvailable) return text;
+    if (!translatorAvailable) {
+      console.log(`⚠️  Translator not available - returning original text: "${text.substring(0, 30)}..."`);
+      return text;
+    }
 
     const targetLangCode = getRapidApiLanguageCode(targetLanguage);
+    console.log(`🔄 Translating to ${targetLanguage} (${targetLangCode}): "${text.substring(0, 40)}..."`);
+
     const response = await axios.post(
       'https://google-translator9.p.rapidapi.com/v2',
       {
@@ -103,21 +142,39 @@ const translateText = async (text, targetLanguage) => {
       }
     );
 
-    return response.data?.data?.translations?.[0]?.translatedText || text;
+    const translated = response.data?.data?.translations?.[0]?.translatedText || text;
+    console.log(`✅ Translated: "${translated.substring(0, 40)}..."`);
+    return translated;
   } catch (err) {
-    console.warn('Translation failed:', err.message);
+    console.warn('❌ Translation API failed:', err.message);
     return text;
   }
 };
 
 // Batch translate
 const batchTranslateText = async (arr, targetLanguage) => {
+  console.log(`📢 Starting batch translation of ${arr.length} segments to ${targetLanguage}`);
   const result = [];
-  for (let item of arr) {
+  let errorCount = 0;
+
+  for (let i = 0; i < arr.length; i++) {
+    const item = arr[i];
     const translated = await translateText(item.text, targetLanguage);
     result.push({ ...item, translatedText: translated });
+
+    // Check if translation actually happened
+    if (translated === item.text) {
+      errorCount++;
+    }
+
+    if ((i + 1) % 10 === 0) {
+      console.log(`   Progress: ${i + 1}/${arr.length} segments processed`);
+    }
+
     await new Promise(r => setTimeout(r, 150));
   }
+
+  console.log(`📊 Translation complete: ${arr.length - errorCount}/${arr.length} segments translated successfully`);
   return result;
 };
 
@@ -182,16 +239,112 @@ const concatWithDemuxer = async (listPath, output) => {
   return output;
 };
 
-// Generate TTS
-const generateAudioWithGTTS = async (text, language, outPath) => {
-  return new Promise((resolve, reject) => {
-    const langMap = {
-      'spanish': 'es','french': 'fr','german': 'de','hindi': 'hi','english': 'en'
-    };
-    const lang = langMap[language.toLowerCase()] || 'en';
+// Language code mappings
+const getLanguageCode = (language) => {
+  const map = {
+    'spanish': 'es','french': 'fr','german': 'de','italian': 'it','portuguese': 'pt',
+    'hindi': 'hi','tamil': 'ta','english': 'en',
+    'bengali': 'bn','telugu': 'te','marathi': 'mr','gujarati': 'gu',
+    'kannada': 'kn','malayalam': 'ml','punjabi': 'pa','urdu': 'ur'
+  };
+  return map[language.toLowerCase()] || 'en';
+};
 
-    const tts = new gTTS(text, lang);
-    tts.save(outPath, (err) => err ? reject(err) : resolve(outPath));
+// gTTS supported languages (fallback)
+const gTTSSupportedLanguages = ['es', 'fr', 'de', 'it', 'pt', 'hi', 'ta', 'en'];
+
+// Generate TTS with Soniox (primary) → ElevenLabs → gTTS (fallback)
+const generateAudioWithTTS = async (text, language, outPath) => {
+  const langCode = getLanguageCode(language);
+
+  // Try Soniox first if available
+  if (sonioxAvailable) {
+    try {
+      console.log(`🔊 Using Soniox for ${language} (${langCode})`);
+
+      const response = await axios.post(
+        'https://tts-rt.soniox.com/tts',
+        {
+          text: text,
+          model: 'tts-rt-v1', // Soniox's multilingual TTS model
+          language: langCode,
+          voice: 'maya', // Default multilingual voice
+          audio_format: 'wav' // Get WAV format directly
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${SONIOX_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: 'arraybuffer'
+        }
+      );
+
+      fsSync.writeFileSync(outPath, Buffer.from(response.data));
+      console.log(`✅ Soniox TTS successful: ${outPath}`);
+      return outPath;
+
+    } catch (err) {
+      console.log(`⚠️ Soniox failed:`);
+      console.log(`   Status: ${err.response?.status || 'unknown'}`);
+      console.log(`   Message: ${err.message}`);
+      console.log(`   Falling back to ElevenLabs/gTTS...`);
+      // Fall through to next option
+    }
+  }
+
+  // Try ElevenLabs second if available
+  if (elevenLabsAvailable && elevenLabsClient) {
+    try {
+      console.log(`🔊 Using ElevenLabs for ${language} (${langCode})`);
+
+      const audioStream = await elevenLabsClient.generate({
+        voice: "21m00Tcm4TlvDq8ikWAM", // Rachel - Multilingual voice
+        model_id: "eleven_multilingual_v2",
+        text: text,
+        language_code: langCode
+      });
+
+      // Convert stream to buffer and save
+      const chunks = [];
+      for await (const chunk of audioStream) {
+        chunks.push(chunk);
+      }
+      const buffer = Buffer.concat(chunks);
+      fsSync.writeFileSync(outPath, buffer);
+
+      console.log(`✅ ElevenLabs TTS successful: ${outPath}`);
+      return outPath;
+
+    } catch (err) {
+      console.log(`⚠️ ElevenLabs failed:`);
+      console.log(`   Status: ${err.statusCode || 'unknown'}`);
+      console.log(`   Message: ${err.message}`);
+      console.log(`   Body: ${JSON.stringify(err.body || {})}`);
+      console.log(`   Falling back to gTTS...`);
+      // Fall through to gTTS
+    }
+  }
+
+  // Fallback to gTTS
+  return new Promise((resolve, reject) => {
+    // Check if gTTS supports this language
+    if (!gTTSSupportedLanguages.includes(langCode)) {
+      return reject(new Error(
+        `Language "${language}" (${langCode}) not supported. ` +
+        `Set SONIOX_API_KEY or ELEVENLABS_API_KEY for all Indian languages.`
+      ));
+    }
+
+    console.log(`🔊 Using gTTS fallback for ${language} (${langCode})`);
+    const tts = new gTTS(text, langCode);
+    tts.save(outPath, (err) => {
+      if (err) reject(err);
+      else {
+        console.log(`✅ gTTS successful: ${outPath}`);
+        resolve(outPath);
+      }
+    });
   });
 };
 
@@ -298,6 +451,11 @@ app.post('/api/dub-video', async (req, res) => {
   const { videoUrl, targetLanguage } = req.body;
   const jobId = uuidv4();
 
+  console.log(`\n🎯 NEW DUBBING JOB`);
+  console.log(`   Video: ${videoUrl}`);
+  console.log(`   Target Language: ${targetLanguage}`);
+  console.log(`   Translator Available: ${translatorAvailable}`);
+
   try {
     await ensureDownloadsDir();
     const jobDir = path.join(__dirname, 'downloads', jobId);
@@ -308,20 +466,32 @@ app.post('/api/dub-video', async (req, res) => {
 
     // Fetch transcript
     let transcript = await fetchTranscript(videoId);
-    console.log(`Fetched transcript: ${transcript.length}`);
+    console.log(`Fetched transcript: ${transcript.length} segments`);
+
+    // Show sample of original transcript
+    if (transcript.length > 0) {
+      console.log(`   Sample original text: "${transcript[0].text.substring(0, 50)}..."`);
+    }
 
     // CLEAN duplicates
     transcript = cleanTranscriptArray(transcript);
     console.log(`Cleaned transcript: ${transcript.length}`);
 
     // Translate
+    console.log(`\n🌐 Starting translation to: ${targetLanguage}`);
     const translated = await batchTranslateText(transcript, targetLanguage);
-    
+
     // Count translation errors
     let translationErrors = 0;
     translated.forEach(item => {
       if (item.translatedText === item.text) translationErrors++;
     });
+
+    // Show sample of translated text
+    if (translated.length > 0) {
+      console.log(`   Sample translated text: "${translated[0].translatedText.substring(0, 50)}..."`);
+    }
+    console.log(`   Translation errors: ${translationErrors}/${translated.length} segments unchanged`);
 
     // TTS + 1.6× processing
     const normalizedClips = [];
@@ -335,7 +505,7 @@ app.post('/api/dub-video', async (req, res) => {
       const speed2x = path.join(jobDir, `clip_2x_${i}.wav`);
 
       // Generate TTS
-      await generateAudioWithGTTS(item.translatedText, targetLanguage, rawMp3);
+      await generateAudioWithTTS(item.translatedText, targetLanguage, rawMp3);
 
       // Normalize
       try {
@@ -453,6 +623,124 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
+// Test translation on startup
+const testTranslation = async () => {
+  if (!translatorAvailable) {
+    console.log('\n⚠️  WARNING: Translation API not configured.');
+    console.log('   Set RAPIDAPI_KEY in .env file to enable translation.');
+    console.log('   Videos will be dubbed in the ORIGINAL language (English).\n');
+    return;
+  }
+
+  console.log('\n🧪 Testing translation API...');
+  try {
+    const testResult = await translateText("Hello world", "spanish");
+    if (testResult === "Hello world") {
+      console.log('❌ Translation test FAILED - API returned original text\n');
+    } else {
+      console.log(`✅ Translation test PASSED: "Hello world" → "${testResult}"\n`);
+    }
+  } catch (err) {
+    console.log(`❌ Translation test ERROR: ${err.message}\n`);
+  }
+};
+
+// Test Soniox on startup
+const testSoniox = async () => {
+  if (!sonioxAvailable) {
+    console.log('\n🔊 Soniox: Not configured');
+    return;
+  }
+
+  console.log('\n🧪 Testing Soniox API...');
+  try {
+    const response = await axios.post(
+      'https://tts-rt.soniox.com/tts',
+      {
+        text: 'Hello',
+        model: 'tts-rt-v1',
+        language: 'en',
+        voice: 'maya',
+        audio_format: 'wav'
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${SONIOX_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+
+    if (response.data && response.data.length > 0) {
+      console.log(`✅ Soniox TTS test PASSED - API key valid`);
+      console.log(`   Audio size: ${response.data.length} bytes\n`);
+    }
+  } catch (err) {
+    console.log(`❌ Soniox test FAILED:`);
+    console.log(`   Status: ${err.response?.status || 'N/A'}`);
+    console.log(`   Message: ${err.message}`);
+
+    if (err.response?.status === 401) {
+      console.log(`\n⚠️  INVALID API KEY - Check your SONIOX_API_KEY`);
+    } else if (err.response?.status === 429) {
+      console.log(`\n⚠️  RATE LIMITED - Too many requests`);
+    } else {
+      console.log(`\n⚠️  API Error - Check https://soniox.com status`);
+    }
+    console.log('');
+  }
+};
+
+// Test ElevenLabs on startup
+const testElevenLabs = async () => {
+  if (!elevenLabsAvailable || !elevenLabsClient) {
+    console.log('\n🔊 ElevenLabs: Not configured');
+    return;
+  }
+
+  console.log('\n🧪 Testing ElevenLabs API...');
+  try {
+    // Try a simple test request
+    const voices = await elevenLabsClient.voices.getAll();
+    console.log(`✅ ElevenLabs API connection OK`);
+    console.log(`   Available voices: ${voices.voices?.length || 0}`);
+
+    // Try to generate a short test audio
+    const testAudio = await elevenLabsClient.generate({
+      voice: "21m00Tcm4TlvDq8ikWAM",
+      model_id: "eleven_multilingual_v2",
+      text: "Hello"
+    });
+
+    // Just consume the stream to verify it works
+    for await (const chunk of testAudio) {
+      // Discard chunks, just testing connection
+      break;
+    }
+
+    console.log(`✅ ElevenLabs TTS test PASSED - Account has credits\n`);
+  } catch (err) {
+    console.log(`❌ ElevenLabs test FAILED:`);
+    console.log(`   Status: ${err.statusCode || 'N/A'}`);
+    console.log(`   Message: ${err.message}`);
+
+    if (err.statusCode === 401) {
+      console.log(`\n⚠️  INVALID API KEY - Check your ELEVENLABS_API_KEY`);
+    } else if (err.statusCode === 402) {
+      console.log(`\n⚠️  OUT OF CREDITS - Your free tier is exhausted`);
+      console.log(`   Options: 1) Upgrade at elevenlabs.io`);
+      console.log(`            2) Create new account with different email`);
+      console.log(`            3) Use only Hindi/Tamil with gTTS fallback\n`);
+    } else {
+      console.log(`\n⚠️  API Error - Check your internet connection\n`);
+    }
+  }
+};
+
+app.listen(PORT, async () => {
   console.log(`🚀 DubFlow API running @ http://localhost:${PORT}`);
+  await testTranslation();
+  await testSoniox();
+  await testElevenLabs();
 });
