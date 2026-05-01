@@ -2,8 +2,7 @@
 
 AI-powered YouTube video dubbing application that translates and dubs videos into 25+ languages with synchronized audio.
 
-![DubFlow Screenshot](<img width="3456" height="1534" alt="image" src="https://github.com/user-attachments/assets/cefbac8f-7c77-4e4a-be47-e8b64245fc03" />
-)
+![DubFlow Screenshot](<img width="3456" height="1534" alt="image" src="https://github.com/user-attachments/assets/cefbac8f-7c77-4e4a-be47-e8b64245fc03" />)
 
 ## Features
 
